@@ -2,7 +2,6 @@ yfinance
 pandas
 numpy
 requests
-python-telegram-bot>=20
-apscheduler
+python-telegram-bot[job-queue]>=20
 pytz
 python-dotenv

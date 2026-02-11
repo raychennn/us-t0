@@ -9,7 +9,7 @@ Commands:
   /YYMMDD SYMBOL    — diagnose a symbol on that date (e.g. /250211 AAPL)
 
 Scheduled:
-  Daily at GMT+8 06:00 — automatic /now
+  Daily at GMT+8 06:00 via Application.job_queue (built-in).
 """
 from __future__ import annotations
 
@@ -17,12 +17,10 @@ import asyncio
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import pytz
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from telegram import Bot, Update
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -65,24 +63,26 @@ def _parse_yymmdd(text: str) -> date | None:
         return None
 
 
-async def _send_text(bot: Bot, chat_id: str, text: str) -> None:
+async def _send_text(context: ContextTypes.DEFAULT_TYPE,
+                     chat_id: str, text: str) -> None:
     """Send a message, falling back to plain text if Markdown fails."""
     try:
-        await bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as md_err:
         logger.warning("MarkdownV2 send failed (%s), sending plain", md_err)
         plain = text.replace("*", "").replace("`", "").replace("\\", "")
-        await bot.send_message(chat_id=chat_id, text=plain)
+        await context.bot.send_message(chat_id=chat_id, text=plain)
 
 
-async def _send_file(bot: Bot, chat_id: str, path: str, caption: str) -> None:
+async def _send_file(context: ContextTypes.DEFAULT_TYPE,
+                     chat_id: str, path: str, caption: str) -> None:
     """Send a document file."""
     if not path or not os.path.exists(path):
         return
     with open(path, "rb") as fh:
-        await bot.send_document(
+        await context.bot.send_document(
             chat_id=chat_id, document=fh,
             filename=os.path.basename(path), caption=caption,
         )
@@ -98,7 +98,8 @@ async def _run_in_executor(func, *args):
 #  /now  &  Scheduled Run
 # ─────────────────────────────────────────────────────────
 
-async def _execute_now(bot: Bot, chat_id: str) -> None:
+async def _execute_now(context: ContextTypes.DEFAULT_TYPE,
+                       chat_id: str) -> None:
     """Run today's screening and send results + TXT."""
     tz = pytz.timezone(config.TIMEZONE)
     date_str = datetime.now(tz).strftime("%Y-%m-%d")
@@ -108,23 +109,34 @@ async def _execute_now(bot: Bot, chat_id: str) -> None:
         sr: ScreenResult = await _run_in_executor(run_screening)
     except Exception as exc:
         logger.error("Screening failed: %s", exc, exc_info=True)
-        await bot.send_message(
+        await context.bot.send_message(
             chat_id=chat_id,
             text=f"⚠️ Screener error ({date_str}):\n{str(exc)[:500]}",
         )
         return
 
     msg = format_screening_msg(sr.top, date_str)
-    await _send_text(bot, chat_id, msg)
-    await _send_file(bot, chat_id, sr.txt_path, "📎 TradingView watchlist")
+    await _send_text(context, chat_id, msg)
+    await _send_file(context, chat_id, sr.txt_path,
+                     "📎 TradingView watchlist")
     logger.info("Live screening sent.")
+
+
+async def _scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback for the daily scheduled job (via job_queue)."""
+    chat_id = config.TELEGRAM_CHAT_ID
+    if not chat_id:
+        logger.error("TELEGRAM_CHAT_ID not set — skipping scheduled run")
+        return
+    await _execute_now(context, chat_id)
 
 
 # ─────────────────────────────────────────────────────────
 #  Command Handlers
 # ─────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update,
+                    ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     await update.message.reply_text(
         f"👋 US RS+T Screener Bot\n\n"
@@ -140,16 +152,22 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_now(update: Update,
+                  ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏳ 篩選中，請稍候（約 10-20 分鐘）…")
-    await _execute_now(ctx.bot, str(update.effective_chat.id))
+    await _execute_now(ctx, str(update.effective_chat.id))
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_status(update: Update,
+                     ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tz = pytz.timezone(config.TIMEZONE)
-    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+    now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+    jobs = ctx.application.job_queue.jobs()
     await update.message.reply_text(
-        f"✅ Bot running\n🕐 {now}\n📅 Next auto-scan: 06:00 GMT+8",
+        f"✅ Bot running\n"
+        f"🕐 {now_str}\n"
+        f"📅 {len(jobs)} scheduled job(s)\n"
+        f"⏰ Next auto-scan: 06:00 GMT+8",
     )
 
 
@@ -157,7 +175,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 #  /YYMMDD  &  /YYMMDD SYMBOL
 # ─────────────────────────────────────────────────────────
 
-async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_backtest(update: Update,
+                       ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle both:
       /250211          → full back-test with forward performance
@@ -166,14 +185,16 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
     m = _BACKTEST_RE.match(text)
     if not m:
-        await update.message.reply_text("❓ 格式: /YYMMDD 或 /YYMMDD SYMBOL")
+        await update.message.reply_text(
+            "❓ 格式: /YYMMDD 或 /YYMMDD SYMBOL")
         return
 
     target = _parse_yymmdd(m.group(1))
     symbol = m.group(2)  # None if not provided
 
     if target is None:
-        await update.message.reply_text("❓ 無效日期格式，請使用 YYMMDD（例: /250211）")
+        await update.message.reply_text(
+            "❓ 無效日期格式，請使用 YYMMDD（例: /250211）")
         return
 
     if target >= date.today():
@@ -181,11 +202,13 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     date_str = target.strftime("%Y-%m-%d")
+    chat_id = str(update.effective_chat.id)
 
     if symbol:
         # ── Diagnose a specific symbol ────────────────────
         await update.message.reply_text(
-            f"⏳ 診斷 {symbol.upper()} @ {date_str} …（約 10-20 分鐘）"
+            f"⏳ 診斷 {symbol.upper()} @ {date_str} …"
+            f"（約 10-20 分鐘）"
         )
         try:
             sr = await _run_in_executor(run_screening, target)
@@ -193,7 +216,8 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             msg = format_diagnose_msg(symbol.upper(), checks, date_str)
         except Exception as exc:
             logger.error("Diagnose failed: %s", exc, exc_info=True)
-            await update.message.reply_text(f"⚠️ 診斷失敗: {str(exc)[:500]}")
+            await update.message.reply_text(
+                f"⚠️ 診斷失敗: {str(exc)[:500]}")
             return
 
         await update.message.reply_text(msg)
@@ -206,8 +230,10 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             sr = await _run_in_executor(run_screening, target)
         except Exception as exc:
-            logger.error("Backtest screening failed: %s", exc, exc_info=True)
-            await update.message.reply_text(f"⚠️ 篩選失敗: {str(exc)[:500]}")
+            logger.error("Backtest screening failed: %s", exc,
+                         exc_info=True)
+            await update.message.reply_text(
+                f"⚠️ 篩選失敗: {str(exc)[:500]}")
             return
 
         msg = format_screening_msg(sr.top, date_str)
@@ -218,40 +244,34 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             fwd_msg = format_forward_msg(perf, sr)
             msg += "\n" + fwd_msg
         except Exception as exc:
-            logger.error("Forward perf calc failed: %s", exc, exc_info=True)
+            logger.error("Forward perf calc failed: %s", exc,
+                         exc_info=True)
             msg += "\n\n⚠️ 前瞻表現計算失敗"
 
-        await _send_text(ctx.bot, str(update.effective_chat.id), msg)
-        await _send_file(ctx.bot, str(update.effective_chat.id),
-                         sr.txt_path, f"📎 回測 {date_str}")
+        await _send_text(ctx, chat_id, msg)
+        await _send_file(ctx, chat_id, sr.txt_path,
+                         f"📎 回測 {date_str}")
 
 
 # ─────────────────────────────────────────────────────────
-#  Scheduler
+#  Application Lifecycle
 # ─────────────────────────────────────────────────────────
 
-def _setup_scheduler(bot: Bot) -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler()
+async def post_init(application: Application) -> None:
+    """
+    Called after Application.initialize().
+    The event loop is guaranteed running here, so registering
+    jobs in job_queue is safe.
+    """
+    tz = pytz.timezone(config.TIMEZONE)
+    target_time = time(hour=6, minute=0, tzinfo=tz)  # GMT+8 06:00
 
-    async def daily_job():
-        chat_id = config.TELEGRAM_CHAT_ID
-        if not chat_id:
-            logger.error("TELEGRAM_CHAT_ID not set — skipping scheduled run")
-            return
-        await _execute_now(bot, chat_id)
-
-    scheduler.add_job(
-        daily_job,
-        CronTrigger(hour=config.CRON_HOUR, minute=config.CRON_MINUTE),
-        id="daily_screening",
-        replace_existing=True,
+    application.job_queue.run_daily(
+        _scheduled_job,
+        time=target_time,
+        name="daily_screening",
     )
-    scheduler.start()
-    logger.info(
-        "Scheduler active — daily at UTC %02d:%02d (GMT+8 06:00)",
-        config.CRON_HOUR, config.CRON_MINUTE,
-    )
-    return scheduler
+    logger.info("Scheduled daily screening at 06:00 %s", config.TIMEZONE)
 
 
 # ─────────────────────────────────────────────────────────
@@ -266,21 +286,23 @@ def main() -> None:
             "Add it to .env or set as environment variable."
         )
 
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .build()
+    )
 
     # Fixed commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Dynamic /YYMMDD handler — must come after fixed commands
+    # Dynamic /YYMMDD handler — registered after fixed commands
+    # so /start, /now, /status take priority
     app.add_handler(MessageHandler(
         filters.Regex(_BACKTEST_RE), cmd_backtest,
     ))
-
-    # Scheduler
-    bot = Bot(token=token)
-    _setup_scheduler(bot)
 
     logger.info("Bot starting …")
     app.run_polling(drop_pending_updates=True)

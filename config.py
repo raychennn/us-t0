@@ -49,7 +49,7 @@ SCORE_WEIGHTS: dict[str, float] = {
 }
 
 # ── Output ────────────────────────────────────────────────
-TOP_N: int = 5
+TOP_N: int = 15
 OUTPUT_DIR: str = "output"
 
 # ── Data ──────────────────────────────────────────────────

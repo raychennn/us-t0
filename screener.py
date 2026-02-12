@@ -1,7 +1,8 @@
 """
 Screening Pipeline
 ══════════════════
-Pool → Download → Filter → RS(20/60) → T-Value → Aux → Score → Top N
+Pool → Download → Filter → RS(20/60) → T-Value → Aux → Score
+     → quoteType Verify → Top N
 
 Supports:
   • Live screening   (as_of_date=None → uses latest market data)
@@ -30,7 +31,7 @@ from indicators import (
     pct_from_52w_high,
     rank_percentile,
 )
-from ticker_pool import fetch_ticker_pool, to_tv_ticker
+from ticker_pool import fetch_ticker_pool, to_tv_ticker, verify_common_stocks
 
 logger = logging.getLogger(__name__)
 
@@ -435,10 +436,18 @@ def run_screening(as_of_date: date | None = None) -> ScreenResult:
     top_all = _score_and_rank(
         aux_syms, rs20_rank, rs60_rank, t_pass, aux_data, result.sym_exchange,
     )
+
+    # 8 — verify top candidates are common stocks (not funds/trusts)
+    # Check 3× TOP_N to have buffer after exclusions
+    verify_n = min(len(top_all), config.TOP_N * 3)
+    candidates = top_all.head(verify_n).index.tolist()
+    verified = verify_common_stocks(candidates)
+    top_all = top_all[top_all.index.isin(verified)]
+
     top = top_all.head(config.TOP_N)
     result.top = top
 
-    # 8 — TXT
+    # 9 — TXT
     result.txt_path = _write_txt(top, date_str)
 
     return result
@@ -599,6 +608,11 @@ def diagnose_symbol(
         checks.append((ok, f"距52週高點 {p52 * 100:.1f}% {'≥' if ok else '<'} {config.NEAR_52W_HIGH_PCT * 100:.0f}%"))
     else:
         checks.append((None, "52週高點 無法計算"))
+
+    # -- quoteType verification --
+    verified = verify_common_stocks([yf_sym])
+    is_stock = yf_sym in verified
+    checks.append((is_stock, f"證券類型: {'普通股 ✓' if is_stock else '非普通股（基金/信託/衍生品）'}"))
 
     # -- final verdict --
     passed_all = all(c[0] is True for c in checks if c[0] is not None)

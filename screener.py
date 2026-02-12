@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -63,7 +64,7 @@ def _download_prices(
     as_of_date: date | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
-    Batch-download OHLCV from Yahoo Finance.
+    Batch-download OHLCV from Yahoo Finance with rate-limit handling.
 
     When *as_of_date* is given, fetches a date range that covers both
     the look-back for indicators and the 3-month forward window.
@@ -78,25 +79,49 @@ def _download_prices(
     if as_of_date is not None:
         dl_kwargs["start"] = as_of_date - timedelta(days=500)
         dl_kwargs["end"] = min(
-            as_of_date + timedelta(days=130),  # 3 mo + buffer
+            as_of_date + timedelta(days=130),
             date.today() + timedelta(days=1),
         )
     else:
         dl_kwargs["period"] = config.DATA_DOWNLOAD_PERIOD
 
+    total_batches = (len(symbols) + bs - 1) // bs
+
     for i in range(0, len(symbols), bs):
         batch = symbols[i: i + bs]
         batch_num = i // bs + 1
-        logger.info("Downloading batch %d (%d tickers) …", batch_num, len(batch))
-        try:
-            raw = yf.download(tickers=batch, **dl_kwargs)
-        except Exception as exc:
-            logger.warning("Batch %d download error: %s", batch_num, exc)
+
+        # Retry loop for rate limiting
+        raw = None
+        for attempt in range(1, config.YFINANCE_MAX_RETRIES + 1):
+            logger.info(
+                "Downloading batch %d/%d (%d tickers)%s …",
+                batch_num, total_batches, len(batch),
+                f" attempt {attempt}" if attempt > 1 else "",
+            )
+            try:
+                raw = yf.download(tickers=batch, **dl_kwargs)
+                break  # success
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "rate" in exc_str or "429" in exc_str or "too many" in exc_str:
+                    wait = config.YFINANCE_RETRY_DELAY * attempt
+                    logger.warning(
+                        "Batch %d rate-limited (attempt %d/%d), "
+                        "waiting %.0fs …",
+                        batch_num, attempt, config.YFINANCE_MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.warning(
+                        "Batch %d download error: %s", batch_num, exc,
+                    )
+                    break  # non-rate-limit error, skip batch
+
+        if raw is None or raw.empty:
             continue
 
-        if raw.empty:
-            continue
-
+        # Parse results
         cols = ["Open", "High", "Low", "Close", "Volume"]
         if len(batch) == 1:
             sym = batch[0]
@@ -114,6 +139,10 @@ def _download_prices(
                         all_data[sym] = df
                 except (KeyError, TypeError):
                     continue
+
+        # Delay between batches to stay under rate limits
+        if batch_num < total_batches:
+            time.sleep(config.YFINANCE_BATCH_DELAY)
 
     logger.info("Downloaded data for %d symbols", len(all_data))
     return all_data

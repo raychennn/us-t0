@@ -49,10 +49,13 @@ SCORE_WEIGHTS: dict[str, float] = {
 }
 
 # ── Output ────────────────────────────────────────────────
-TOP_N: int = 15
+TOP_N: int = 5
 OUTPUT_DIR: str = "output"
 
 # ── Data ──────────────────────────────────────────────────
 DATA_DOWNLOAD_PERIOD: str = "15mo"
-YFINANCE_BATCH_SIZE: int = 500
-FORWARD_TRADING_DAYS: int = 63  # ≈ 3 months for backtest
+YFINANCE_BATCH_SIZE: int = 200       # smaller batches to avoid rate limit
+YFINANCE_BATCH_DELAY: float = 2.0    # seconds between batches
+YFINANCE_MAX_RETRIES: int = 3        # retry count per batch on rate limit
+YFINANCE_RETRY_DELAY: float = 30.0   # base seconds to wait on 429
+FORWARD_TRADING_DAYS: int = 63       # ≈ 3 months for backtest

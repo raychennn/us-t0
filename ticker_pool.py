@@ -145,27 +145,48 @@ def verify_common_stocks(yf_symbols: list[str]) -> set[str]:
     Check a small batch of tickers via yfinance to confirm they are
     common stocks (quoteType == 'EQUITY' and not a fund/trust by name).
 
-    Designed to run on the final ~20-30 candidates, not the full universe.
+    Designed to run on the final ~15-20 candidates, not the full universe.
+    Each .info call is a separate HTTP request, so we add a short delay
+    between calls to avoid rate limiting.
 
     Returns the set of symbols that pass verification.
     """
     if not yf_symbols:
         return set()
 
+    import time
     import yfinance as yf
 
     verified: set[str] = set()
+    delay = 0.5  # seconds between individual info calls
 
-    # Use Tickers object for batch info retrieval
-    tickers = yf.Tickers(" ".join(yf_symbols))
+    for i, sym in enumerate(yf_symbols):
+        # Throttle: pause between requests (skip before first)
+        if i > 0:
+            time.sleep(delay)
 
-    for sym in yf_symbols:
-        try:
-            info = tickers.tickers[sym].info
-        except (KeyError, AttributeError) as exc:
-            logger.debug("verify_common_stocks: %s info unavailable: %s",
-                         sym, exc)
-            # If we can't verify, give benefit of the doubt
+        info: dict = {}
+        for attempt in range(1, 4):  # up to 3 attempts
+            try:
+                info = yf.Ticker(sym).info or {}
+                break
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "rate" in exc_str or "429" in exc_str or "too many" in exc_str:
+                    wait = 10 * attempt
+                    logger.warning(
+                        "verify %s: rate-limited (attempt %d/3), "
+                        "waiting %ds …", sym, attempt, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.debug(
+                        "verify %s: info unavailable: %s", sym, exc,
+                    )
+                    break  # non-rate-limit error, stop retrying
+
+        if not info:
+            # Cannot verify — give benefit of the doubt
             verified.add(sym)
             continue
 
